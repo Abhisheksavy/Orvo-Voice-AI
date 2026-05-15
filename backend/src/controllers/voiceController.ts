@@ -33,9 +33,10 @@ export async function voiceChat(req: Request, res: Response, next: NextFunction)
     const file = req.file;
     if (!file) throw new AppError('Audio file is required', 400);
 
-    const { sessionId, languageCode = 'hi-IN' } = req.body as {
+    const { sessionId, languageCode = 'hi-IN', systemPrompt } = req.body as {
       sessionId?: string;
       languageCode?: string;
+      systemPrompt?: string;
     };
     if (!sessionId) throw new AppError('sessionId is required', 400);
 
@@ -46,13 +47,13 @@ export async function voiceChat(req: Request, res: Response, next: NextFunction)
     if (!transcript?.trim()) throw new AppError('Could not understand audio', 422);
     logger.info('STT done', { sessionId, transcript: transcript.slice(0, 80) });
 
-    // 2. Load history + call Gemma
+    // 2. Load history + call LLM
     let conversation = await Conversation.findOne({ sessionId });
     if (!conversation) {
       conversation = await Conversation.create({ sessionId, messages: [], languageCode: lang });
     }
 
-    const assistantText = await chatWithGemma(transcript, conversation.messages);
+    const assistantText = await chatWithGemma(transcript, conversation.messages, systemPrompt);
     logger.info('LLM done', { sessionId, preview: assistantText.slice(0, 80) });
 
     // 3. TTS
@@ -90,6 +91,51 @@ export async function getHistory(req: Request, res: Response, next: NextFunction
     const conversation = await Conversation.findOne({ sessionId });
     if (!conversation) throw new AppError('Session not found', 404);
     res.json({ success: true, data: { sessionId, messages: conversation.messages } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/voice/chat-text
+ * Text-only chat — skips STT, goes straight to LLM + TTS.
+ */
+export async function textChat(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { sessionId, text, languageCode = 'hi-IN', systemPrompt } = req.body as {
+      sessionId?: string;
+      text?: string;
+      languageCode?: string;
+      systemPrompt?: string;
+    };
+    if (!sessionId) throw new AppError('sessionId is required', 400);
+    if (!text?.trim()) throw new AppError('text is required', 400);
+
+    const lang = languageCode as SarvamLanguage;
+
+    let conversation = await Conversation.findOne({ sessionId });
+    if (!conversation) {
+      conversation = await Conversation.create({ sessionId, messages: [], languageCode: lang });
+    }
+
+    const assistantText = await chatWithGemma(text.trim(), conversation.messages, systemPrompt);
+    const audioBuffer = await synthesizeSpeech(assistantText, lang);
+
+    conversation.messages.push(
+      { role: 'user', text: text.trim(), createdAt: new Date() },
+      { role: 'assistant', text: assistantText, createdAt: new Date() },
+    );
+    await conversation.save();
+
+    res.json({
+      success: true,
+      data: {
+        userText: text.trim(),
+        assistantText,
+        audioBase64: audioBuffer.toString('base64'),
+        audioMimeType: 'audio/wav',
+      },
+    });
   } catch (err) {
     next(err);
   }

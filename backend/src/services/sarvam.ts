@@ -2,6 +2,7 @@ import axios from 'axios';
 import FormData from 'form-data';
 import logger from '../utils/logger';
 import { AppError } from '../middleware/errorHandler';
+import { convertToWav } from '../utils/convertToWav';
 
 const BASE = 'https://api.sarvam.ai';
 
@@ -10,7 +11,8 @@ export type SarvamLanguage =
   | 'ml-IN' | 'mr-IN' | 'od-IN' | 'pa-IN' | 'ta-IN' | 'te-IN';
 
 export type SarvamSpeaker =
-  | 'meera' | 'pavithra' | 'maitreyi' | 'arvind' | 'amol' | 'amartya';
+  | 'anushka' | 'manisha' | 'vidya' | 'arya' | 'priya' | 'neha'
+  | 'abhilash' | 'karun' | 'hitesh' | 'rahul' | 'rohan';
 
 /**
  * Transcribe audio buffer → text using Sarvam STT.
@@ -21,12 +23,20 @@ export async function transcribeAudio(
   mimeType: string,
   languageCode: SarvamLanguage = 'hi-IN',
 ): Promise<{ transcript: string; language: string }> {
-  const ext = mimeType.split('/')[1]?.split(';')[0] ?? 'webm';
+  const cleanMime = mimeType.split(';')[0].trim();
+  const inputExt = cleanMime.split('/')[1] ?? 'webm';
+
+  logger.debug('STT input', { mimeType: cleanMime, inputBytes: audioBuffer.length });
+
+  const wavBuffer = await convertToWav(audioBuffer, inputExt);
+  logger.debug('STT wav converted', { wavBytes: wavBuffer.length });
+
   const form = new FormData();
-  form.append('file', audioBuffer, { filename: `audio.${ext}`, contentType: mimeType });
-  form.append('model', 'saarika:v2');
-  form.append('language_code', languageCode);
+  form.append('file', wavBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
+  form.append('model', 'saarika:v2.5');
   form.append('with_timestamps', 'false');
+  // language_code optional — v2.5 auto-detects; only send if explicitly set
+  if (languageCode) form.append('language_code', languageCode);
 
   try {
     const { data } = await axios.post<{ transcript: string; language_code: string }>(
@@ -43,7 +53,11 @@ export async function transcribeAudio(
     logger.debug('Sarvam STT success', { transcript: data.transcript?.slice(0, 80) });
     return { transcript: data.transcript, language: data.language_code };
   } catch (err) {
-    logger.error('Sarvam STT error', { err });
+    if (axios.isAxiosError(err)) {
+      logger.error('Sarvam STT error', { status: err.response?.status, data: err.response?.data, message: err.message });
+    } else {
+      logger.error('Sarvam STT error', { err });
+    }
     throw new AppError('Speech-to-text failed', 502);
   }
 }
@@ -54,7 +68,7 @@ export async function transcribeAudio(
 export async function synthesizeSpeech(
   text: string,
   languageCode: SarvamLanguage = 'hi-IN',
-  speaker: SarvamSpeaker = 'meera',
+  speaker: SarvamSpeaker = 'anushka',
 ): Promise<Buffer> {
   try {
     const { data } = await axios.post<{ audios: string[] }>(
@@ -63,7 +77,7 @@ export async function synthesizeSpeech(
         inputs: [text.slice(0, 500)],
         target_language_code: languageCode,
         speaker,
-        model: 'bulbul:v1',
+        model: 'bulbul:v2',
         enable_preprocessing: true,
       },
       {
@@ -79,7 +93,11 @@ export async function synthesizeSpeech(
     logger.debug('Sarvam TTS success', { chars: text.length });
     return Buffer.from(b64, 'base64');
   } catch (err) {
-    logger.error('Sarvam TTS error', { err });
+    if (axios.isAxiosError(err)) {
+      logger.error('Sarvam TTS error', { status: err.response?.status, data: err.response?.data });
+    } else {
+      logger.error('Sarvam TTS error', { err });
+    }
     throw new AppError('Text-to-speech failed', 502);
   }
 }
