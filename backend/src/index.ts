@@ -4,6 +4,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import mongoose from 'mongoose';
 import voiceRouter from './routes/voice';
+import ragRouter from './routes/rag';
 import { errorHandler } from './middleware/errorHandler';
 import logger from './utils/logger';
 
@@ -17,6 +18,7 @@ app.use(morgan('dev'));
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.use('/api/voice', voiceRouter);
+app.use('/api/rag', ragRouter);
 app.use(errorHandler);
 
 async function bootstrap(): Promise<void> {

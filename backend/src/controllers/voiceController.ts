@@ -2,9 +2,15 @@ import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import Conversation from '../models/Conversation';
 import { transcribeAudio, synthesizeSpeech, type SarvamLanguage } from '../services/sarvam';
-import { chatWithGemma } from '../services/gemma';
+import { chatWithGemma, type AiChoice, type AiProvider } from '../services/gemma';
+import { retrieveContext } from '../services/rag';
 import { AppError } from '../middleware/errorHandler';
 import logger from '../utils/logger';
+
+function parseAiChoice(provider?: string, model?: string): AiChoice | undefined {
+  if (provider !== 'local' && provider !== 'groq') return undefined;
+  return { provider: provider as AiProvider, model: model?.trim() || undefined };
+}
 
 /**
  * POST /api/voice/session
@@ -33,27 +39,37 @@ export async function voiceChat(req: Request, res: Response, next: NextFunction)
     const file = req.file;
     if (!file) throw new AppError('Audio file is required', 400);
 
-    const { sessionId, languageCode = 'hi-IN', systemPrompt } = req.body as {
+    const { sessionId, languageCode = 'hi-IN', systemPrompt, aiProvider, aiModel } = req.body as {
       sessionId?: string;
       languageCode?: string;
       systemPrompt?: string;
+      aiProvider?: string;
+      aiModel?: string;
     };
     if (!sessionId) throw new AppError('sessionId is required', 400);
 
     const lang = languageCode as SarvamLanguage;
+    const aiChoice = parseAiChoice(aiProvider, aiModel);
 
     // 1. STT
     const { transcript } = await transcribeAudio(file.buffer, file.mimetype, lang);
-    if (!transcript?.trim()) throw new AppError('Could not understand audio', 422);
+    if (!transcript?.trim()) {
+      logger.info('STT empty transcript — likely noise, ignoring', { sessionId });
+      res.json({ success: true, data: { empty: true } });
+      return;
+    }
     logger.info('STT done', { sessionId, transcript: transcript.slice(0, 80) });
 
-    // 2. Load history + call LLM
-    let conversation = await Conversation.findOne({ sessionId });
-    if (!conversation) {
-      conversation = await Conversation.create({ sessionId, messages: [], languageCode: lang });
-    }
+    // 2. Load history + RAG retrieval (parallel)
+    const [conversation, ragContext] = await Promise.all([
+      Conversation.findOne({ sessionId }).then(async (c) =>
+        c ?? Conversation.create({ sessionId, messages: [], languageCode: lang }),
+      ),
+      retrieveContext(transcript),
+    ]);
+    if (ragContext) logger.info('RAG context injected', { sessionId, chars: ragContext.length });
 
-    const assistantText = await chatWithGemma(transcript, conversation.messages, systemPrompt);
+    const assistantText = await chatWithGemma(transcript, conversation.messages, systemPrompt, aiChoice, ragContext);
     logger.info('LLM done', { sessionId, preview: assistantText.slice(0, 80) });
 
     // 3. TTS
@@ -102,24 +118,38 @@ export async function getHistory(req: Request, res: Response, next: NextFunction
  */
 export async function textChat(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { sessionId, text, languageCode = 'hi-IN', systemPrompt } = req.body as {
+    const { sessionId, text, languageCode = 'hi-IN', systemPrompt, aiProvider, aiModel, skipTts } = req.body as {
       sessionId?: string;
       text?: string;
       languageCode?: string;
       systemPrompt?: string;
+      aiProvider?: string;
+      aiModel?: string;
+      skipTts?: boolean;
     };
     if (!sessionId) throw new AppError('sessionId is required', 400);
     if (!text?.trim()) throw new AppError('text is required', 400);
 
     const lang = languageCode as SarvamLanguage;
+    const aiChoice = parseAiChoice(aiProvider, aiModel);
 
-    let conversation = await Conversation.findOne({ sessionId });
-    if (!conversation) {
-      conversation = await Conversation.create({ sessionId, messages: [], languageCode: lang });
+    const [conversation, ragContext] = await Promise.all([
+      Conversation.findOne({ sessionId }).then(async (c) =>
+        c ?? Conversation.create({ sessionId, messages: [], languageCode: lang }),
+      ),
+      retrieveContext(text.trim()),
+    ]);
+    if (ragContext) logger.info('RAG context injected', { sessionId, chars: ragContext.length });
+
+    const assistantText = await chatWithGemma(text.trim(), conversation.messages, systemPrompt, aiChoice, ragContext);
+
+    let audioBase64 = '';
+    let audioMimeType = '';
+    if (!skipTts) {
+      const audioBuffer = await synthesizeSpeech(assistantText, lang);
+      audioBase64 = audioBuffer.toString('base64');
+      audioMimeType = 'audio/wav';
     }
-
-    const assistantText = await chatWithGemma(text.trim(), conversation.messages, systemPrompt);
-    const audioBuffer = await synthesizeSpeech(assistantText, lang);
 
     conversation.messages.push(
       { role: 'user', text: text.trim(), createdAt: new Date() },
@@ -132,8 +162,8 @@ export async function textChat(req: Request, res: Response, next: NextFunction):
       data: {
         userText: text.trim(),
         assistantText,
-        audioBase64: audioBuffer.toString('base64'),
-        audioMimeType: 'audio/wav',
+        audioBase64,
+        audioMimeType,
       },
     });
   } catch (err) {

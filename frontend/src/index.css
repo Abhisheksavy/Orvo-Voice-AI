@@ -6,32 +6,47 @@
 
 @layer base {
   body {
-    @apply bg-slate-50 text-gray-900 antialiased;
+    @apply bg-white text-slate-900 antialiased;
     font-family: 'Inter', system-ui, sans-serif;
+    font-feature-settings: 'cv11', 'ss01';
   }
 }
 
 @layer utilities {
   .scrollbar-thin::-webkit-scrollbar { width: 4px; }
   .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
-  .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 99px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
+
+  .surface-gradient {
+    background:
+      radial-gradient(1200px 600px at 50% -100px, rgba(99, 102, 241, 0.08), transparent 60%),
+      radial-gradient(800px 400px at 100% 100%, rgba(168, 85, 247, 0.05), transparent 60%),
+      linear-gradient(180deg, #fafafa 0%, #f4f4f5 100%);
+  }
 }
 
 @keyframes orb-ring-pulse {
-  0%   { transform: scale(1);    opacity: 0.7; }
-  100% { transform: scale(1.65); opacity: 0; }
+  0%   { transform: scale(1);    opacity: 0.55; }
+  100% { transform: scale(1.85); opacity: 0; }
 }
 
 .orb-ring {
   position: absolute;
   inset: 0;
   border-radius: 9999px;
-  border: 2px solid currentColor;
-  animation: orb-ring-pulse 1.4s ease-out infinite;
+  border: 1.5px solid currentColor;
+  animation: orb-ring-pulse 1.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
 }
 
 @keyframes wave {
-  0%, 100% { transform: scaleY(0.35); }
+  0%, 100% { transform: scaleY(0.3); }
   50%       { transform: scaleY(1); }
 }
-.wave-bar { animation: wave 0.9s ease-in-out infinite; }
+.wave-bar { animation: wave 0.95s ease-in-out infinite; transform-origin: center; }
+
+@keyframes orb-breath {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.04); }
+}
+.orb-breath { animation: orb-breath 3.6s ease-in-out infinite; }
