@@ -120,6 +120,11 @@ export async function uploadKnowledgeFile(file: File): Promise<{ documentId: str
   return data.data;
 }
 
+export async function uploadKnowledgeText(title: string, text: string): Promise<{ documentId: string; chunkCount: number }> {
+  const { data } = await ragApi.post<{ success: boolean; data: { documentId: string; chunkCount: number } }>('/upload-text', { title, text });
+  return data.data;
+}
+
 export async function listKnowledgeDocs(): Promise<KnowledgeDoc[]> {
   const { data } = await ragApi.get<{ success: boolean; data: KnowledgeDoc[] }>('/documents');
   return data.data;

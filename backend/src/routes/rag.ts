@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { uploadDocument, listDocuments, removeDocument } from '../controllers/ragController';
+import { uploadDocument, uploadTextEntry, listDocuments, removeDocument } from '../controllers/ragController';
 
 const router = Router();
 
@@ -20,6 +20,7 @@ const upload = multer({
 });
 
 router.post('/upload', upload.single('file'), uploadDocument);
+router.post('/upload-text', uploadTextEntry);
 router.get('/documents', listDocuments);
 router.delete('/documents/:documentId', removeDocument);
 

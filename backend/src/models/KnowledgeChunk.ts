@@ -6,8 +6,8 @@ export interface IKnowledgeDocument extends Document {
   mimetype: string;
   chunkCount: number;
   sizeBytes: number;
-  s3Key: string;
-  fileUrl: string;
+  s3Key?: string;
+  fileUrl?: string;
   createdAt: Date;
 }
 
@@ -26,8 +26,8 @@ const knowledgeDocumentSchema = new Schema<IKnowledgeDocument>(
     mimetype:   { type: String, required: true },
     chunkCount: { type: Number, default: 0 },
     sizeBytes:  { type: Number, default: 0 },
-    s3Key:      { type: String, required: true },
-    fileUrl:    { type: String, required: true },
+    s3Key:      { type: String, default: undefined },
+    fileUrl:    { type: String, default: undefined },
   },
   { timestamps: true },
 );

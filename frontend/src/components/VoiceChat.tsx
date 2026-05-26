@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useCallRecorder } from '../hooks/useCallRecorder';
 import { useAmbience, type AmbienceMode } from '../hooks/useAmbience';
-import { createSession, sendAudio, sendText, sendTextOnly, clearHistory, uploadKnowledgeFile, listKnowledgeDocs, deleteKnowledgeDoc, type KnowledgeDoc } from '../api/voice';
+import { createSession, sendAudio, sendText, sendTextOnly, clearHistory, uploadKnowledgeFile, uploadKnowledgeText, listKnowledgeDocs, deleteKnowledgeDoc, type KnowledgeDoc } from '../api/voice';
 
 const DEFAULT_SYSTEM_PROMPT = `You are Orvo, an AI-powered virtual receptionist for hospitals and healthcare clinics, designed for real-time voice conversations over phone calls.
 Your role is to speak naturally like a professional hospital front-desk executive — calm, helpful, polite, fast, and conversational.
@@ -114,6 +114,10 @@ export default function VoiceChat() {
   const [knowledgeDocs, setKnowledgeDocs] = useState<KnowledgeDoc[]>([]);
   const [kbUploading, setKbUploading] = useState(false);
   const [kbError, setKbError] = useState<string | null>(null);
+  const [kbTab, setKbTab] = useState<'file' | 'text'>('file');
+  const [kbTextTitle, setKbTextTitle] = useState('');
+  const [kbTextBody, setKbTextBody] = useState('');
+  const [kbTextSubmitting, setKbTextSubmitting] = useState(false);
   const kbFileRef = useRef<HTMLInputElement | null>(null);
   const widgetEndRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -373,6 +377,25 @@ export default function VoiceChat() {
       setKbError('Delete failed.');
     }
   }, []);
+
+  const handleKbTextSubmit = useCallback(async () => {
+    const title = kbTextTitle.trim();
+    const body  = kbTextBody.trim();
+    if (!title || !body) { setKbError('Both title and text are required.'); return; }
+    setKbTextSubmitting(true);
+    setKbError(null);
+    try {
+      await uploadKnowledgeText(title, body);
+      const docs = await listKnowledgeDocs();
+      setKnowledgeDocs(docs);
+      setKbTextTitle('');
+      setKbTextBody('');
+    } catch {
+      setKbError('Failed to save text. Please try again.');
+    } finally {
+      setKbTextSubmitting(false);
+    }
+  }, [kbTextTitle, kbTextBody]);
 
   // ── Widget (text-only side chat) ─────────────────────────────────────────────
   const handleWidgetSend = useCallback(async () => {
@@ -942,6 +965,8 @@ export default function VoiceChat() {
           onClick={(e) => { if (e.target === e.currentTarget) setShowKnowledge(false); }}
         >
           <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-lg border border-slate-200 overflow-hidden flex flex-col max-h-[88vh]">
+
+            {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
               <div className="flex items-center gap-2.5">
                 <div className="w-7 h-7 rounded-lg bg-indigo-50 flex items-center justify-center ring-1 ring-indigo-100">
@@ -950,8 +975,8 @@ export default function VoiceChat() {
                   </svg>
                 </div>
                 <div className="leading-tight">
-                  <div className="text-[13.5px] font-semibold text-slate-900">Knowledge Base</div>
-                  <div className="text-[10.5px] text-slate-500">{knowledgeDocs.length} document{knowledgeDocs.length !== 1 ? 's' : ''} uploaded</div>
+                  <div className="text-[13.5px] font-semibold text-slate-900">Train Knowledge Base</div>
+                  <div className="text-[10.5px] text-slate-500">{knowledgeDocs.length} entr{knowledgeDocs.length !== 1 ? 'ies' : 'y'} trained</div>
                 </div>
               </div>
               <button onClick={() => setShowKnowledge(false)} className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-400 transition cursor-pointer">
@@ -959,61 +984,138 @@ export default function VoiceChat() {
               </button>
             </div>
 
-            {/* Upload area */}
-            <div className="px-5 pt-4 pb-2">
-              <input ref={kbFileRef} type="file" accept=".pdf,.docx,.doc,.txt" className="hidden" onChange={(e) => void handleKbUpload(e)} />
+            {/* Tabs */}
+            <div className="flex border-b border-slate-100 px-5 pt-3 gap-1">
               <button
-                onClick={() => kbFileRef.current?.click()}
-                disabled={kbUploading}
-                className="w-full border-2 border-dashed border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 rounded-xl py-5 flex flex-col items-center gap-2 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                onClick={() => { setKbTab('file'); setKbError(null); }}
+                className={`px-3.5 py-1.5 text-[12.5px] font-medium rounded-t-lg transition cursor-pointer ${kbTab === 'file' ? 'bg-indigo-50 text-indigo-700 border border-b-white border-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
               >
-                {kbUploading ? (
-                  <div className="flex items-center gap-2 text-indigo-600 text-[13px] font-medium">
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
-                    Processing…
-                  </div>
-                ) : (
-                  <>
-                    <svg className="w-6 h-6 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-                    </svg>
-                    <span className="text-[13px] font-medium text-slate-600">Click to upload PDF, DOCX, or TXT</span>
-                    <span className="text-[11px] text-slate-400">Max 20 MB</span>
-                  </>
-                )}
+                Upload File
               </button>
+              <button
+                onClick={() => { setKbTab('text'); setKbError(null); }}
+                className={`px-3.5 py-1.5 text-[12.5px] font-medium rounded-t-lg transition cursor-pointer ${kbTab === 'text' ? 'bg-indigo-50 text-indigo-700 border border-b-white border-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                Paste Text
+              </button>
+            </div>
+
+            {/* Tab content */}
+            <div className="px-5 pt-4 pb-2">
+              {kbTab === 'file' ? (
+                <>
+                  <input ref={kbFileRef} type="file" accept=".pdf,.docx,.doc,.txt" className="hidden" onChange={(e) => void handleKbUpload(e)} />
+                  <button
+                    onClick={() => kbFileRef.current?.click()}
+                    disabled={kbUploading}
+                    className="w-full border-2 border-dashed border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 rounded-xl py-5 flex flex-col items-center gap-2 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {kbUploading ? (
+                      <div className="flex items-center gap-2 text-indigo-600 text-[13px] font-medium">
+                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                        Processing…
+                      </div>
+                    ) : (
+                      <>
+                        <svg className="w-6 h-6 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                        </svg>
+                        <span className="text-[13px] font-medium text-slate-600">Click to upload PDF, DOCX, or TXT</span>
+                        <span className="text-[11px] text-slate-400">Max 20 MB</span>
+                      </>
+                    )}
+                  </button>
+                </>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  <div>
+                    <label className="block text-[11.5px] font-medium text-slate-600 mb-1">Title / Source name</label>
+                    <input
+                      type="text"
+                      value={kbTextTitle}
+                      onChange={(e) => setKbTextTitle(e.target.value)}
+                      placeholder="e.g. Hospital FAQ, Doctor Schedule, Services List…"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-200 text-[13px] text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      disabled={kbTextSubmitting}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11.5px] font-medium text-slate-600 mb-1">
+                      Text content
+                      {kbTextBody.length > 0 && (
+                        <span className="ml-2 text-slate-400 font-normal">{kbTextBody.length.toLocaleString()} chars</span>
+                      )}
+                    </label>
+                    <textarea
+                      value={kbTextBody}
+                      onChange={(e) => setKbTextBody(e.target.value)}
+                      placeholder="Paste any long text here — FAQs, procedures, doctor bios, service descriptions, schedules…"
+                      rows={7}
+                      className="w-full px-3 py-2 rounded-lg border border-slate-200 text-[13px] text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none"
+                      disabled={kbTextSubmitting}
+                    />
+                  </div>
+                  <button
+                    onClick={() => void handleKbTextSubmit()}
+                    disabled={kbTextSubmitting || !kbTextTitle.trim() || !kbTextBody.trim()}
+                    className="flex items-center justify-center gap-2 w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-[13px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {kbTextSubmitting ? (
+                      <>
+                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                        Chunking & saving…
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>
+                        Train with this text
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
               {kbError && <p className="mt-2 text-[12px] text-red-600">{kbError}</p>}
             </div>
 
-            {/* Document list */}
-            <div className="flex-1 overflow-y-auto px-5 pb-5 space-y-2 mt-2">
-              {knowledgeDocs.length === 0 && !kbUploading && (
-                <p className="text-center text-[12.5px] text-slate-400 py-6">No documents yet. Upload one to train Orvo on your hospital data.</p>
+            {/* Trained entries list */}
+            <div className="flex-1 overflow-y-auto px-5 pb-5 space-y-2 mt-3">
+              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Trained entries</div>
+              {knowledgeDocs.length === 0 && !kbUploading && !kbTextSubmitting && (
+                <p className="text-center text-[12.5px] text-slate-400 py-4">Nothing trained yet. Upload a file or paste text above.</p>
               )}
-              {knowledgeDocs.map((doc) => (
-                <div key={doc.documentId} className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50/60">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center shrink-0">
-                      <svg className="w-4 h-4 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+              {knowledgeDocs.map((doc) => {
+                const isText = doc.mimetype === 'text/plain' && doc.sizeBytes < 50000 && !doc.filename.match(/\.(txt|TXT)$/);
+                return (
+                  <div key={doc.documentId} className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50/60">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center shrink-0">
+                        {isText ? (
+                          <svg className="w-4 h-4 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25H12" />
+                          </svg>
+                        ) : (
+                          <svg className="w-4 h-4 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                          </svg>
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[12.5px] font-medium text-slate-800 truncate">{doc.filename}</div>
+                        <div className="text-[10.5px] text-slate-400">{doc.chunkCount} chunks · {(doc.sizeBytes / 1024).toFixed(0)} KB</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => void handleKbDelete(doc.documentId)}
+                      className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-red-50 text-slate-400 hover:text-red-500 transition cursor-pointer shrink-0"
+                      title="Delete"
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
                       </svg>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[12.5px] font-medium text-slate-800 truncate">{doc.filename}</div>
-                      <div className="text-[10.5px] text-slate-400">{doc.chunkCount} chunks · {(doc.sizeBytes / 1024).toFixed(0)} KB</div>
-                    </div>
+                    </button>
                   </div>
-                  <button
-                    onClick={() => void handleKbDelete(doc.documentId)}
-                    className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-red-50 text-slate-400 hover:text-red-500 transition cursor-pointer shrink-0"
-                    title="Delete"
-                  >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
-                    </svg>
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
