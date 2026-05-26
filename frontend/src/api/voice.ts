@@ -8,6 +8,7 @@ export interface ChatResponse {
   audioBase64: string;
   audioMimeType: string;
   empty?: boolean;
+  _timing?: { sttMs: number; ragMs: number; llmMs: number; ttsMs: number; totalMs: number };
 }
 
 export async function createSession(existingId?: string): Promise<string> {
@@ -20,6 +21,8 @@ export async function createSession(existingId?: string): Promise<string> {
 export interface AiChoice {
   aiProvider: 'local' | 'groq';
   aiModel?: string;
+  numGpu?: number;
+  temperature?: number;
 }
 
 export async function sendAudio(
@@ -37,6 +40,8 @@ export async function sendAudio(
   if (ai) {
     form.append('aiProvider', ai.aiProvider);
     if (ai.aiModel) form.append('aiModel', ai.aiModel);
+    if (ai.numGpu !== undefined) form.append('numGpu', String(ai.numGpu));
+    if (ai.temperature !== undefined) form.append('temperature', String(ai.temperature));
   }
 
   const { data } = await api.post<{ success: boolean; data: ChatResponse & { empty?: boolean } }>('/chat', form, {
@@ -68,7 +73,7 @@ export async function sendText(
     sessionId,
     languageCode,
     ...(systemPrompt ? { systemPrompt } : {}),
-    ...(ai ? { aiProvider: ai.aiProvider, ...(ai.aiModel ? { aiModel: ai.aiModel } : {}) } : {}),
+    ...(ai ? { aiProvider: ai.aiProvider, ...(ai.aiModel ? { aiModel: ai.aiModel } : {}), ...(ai.numGpu !== undefined ? { numGpu: ai.numGpu } : {}), ...(ai.temperature !== undefined ? { temperature: ai.temperature } : {}) } : {}),
   });
   return data.data;
 }
@@ -95,9 +100,63 @@ export async function sendTextOnly(
     languageCode,
     skipTts: true,
     ...(systemPrompt ? { systemPrompt } : {}),
-    ...(ai ? { aiProvider: ai.aiProvider, ...(ai.aiModel ? { aiModel: ai.aiModel } : {}) } : {}),
+    ...(ai ? { aiProvider: ai.aiProvider, ...(ai.aiModel ? { aiModel: ai.aiModel } : {}), ...(ai.numGpu !== undefined ? { numGpu: ai.numGpu } : {}), ...(ai.temperature !== undefined ? { temperature: ai.temperature } : {}) } : {}),
   });
   return { userText: data.data.userText, assistantText: data.data.assistantText };
+}
+
+// ── Streaming audio ───────────────────────────────────────────────────────────
+
+export type StreamEvent =
+  | { type: 'transcript'; text: string; sttMs: number }
+  | { type: 'audio'; text: string; audioBase64: string; audioMimeType: string }
+  | { type: 'done'; assistantText: string; llmMs: number; totalMs: number }
+  | { type: 'empty' }
+  | { type: 'error'; message: string };
+
+export async function* streamAudioChunks(
+  audioBlob: Blob,
+  sessionId: string,
+  languageCode = 'en-IN',
+  systemPrompt?: string,
+  ai?: AiChoice,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const form = new FormData();
+  form.append('audio', audioBlob, 'recording.webm');
+  form.append('sessionId', sessionId);
+  form.append('languageCode', languageCode);
+  if (systemPrompt) form.append('systemPrompt', systemPrompt);
+  if (ai) {
+    form.append('aiProvider', ai.aiProvider);
+    if (ai.aiModel) form.append('aiModel', ai.aiModel);
+    if (ai.numGpu !== undefined) form.append('numGpu', String(ai.numGpu));
+    if (ai.temperature !== undefined) form.append('temperature', String(ai.temperature));
+  }
+
+  const response = await fetch('/api/voice/chat-stream', { method: 'POST', body: form, signal });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const blocks = buf.split('\n\n');
+      buf = blocks.pop() ?? '';
+      for (const block of blocks) {
+        const line = block.trim();
+        if (!line.startsWith('data: ')) continue;
+        try { yield JSON.parse(line.slice(6)) as StreamEvent; } catch { /* skip */ }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 // ── RAG / Knowledge Base ──────────────────────────────────────────────────────

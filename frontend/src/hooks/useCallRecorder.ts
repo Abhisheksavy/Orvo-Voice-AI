@@ -17,12 +17,14 @@ interface UseCallRecorderReturn {
   setMuted: (muted: boolean) => void;
 }
 
-const BASE_SPEECH_THRESHOLD = 0.020;
-const SILENCE_MS = 650;
-const MIN_SPEECH_MS = 250;
-// Used to detect interruption — needs only a short burst (~100ms) to fire,
-// so we react quickly when the user starts talking over the AI.
-const INTERRUPT_TRIGGER_MS = 90;
+const BASE_SPEECH_THRESHOLD = 0.006;
+const SILENCE_MS = 1200;
+const MIN_SPEECH_MS = 300;
+// Two separate trigger windows:
+// - Listening: 100ms — responds quickly to normal speech
+// - Playback:  200ms — short sustain to confirm intentional speech, not a cough
+const SPEECH_TRIGGER_MS = 100;
+const INTERRUPT_TRIGGER_MS = 200;
 
 export function useCallRecorder(opts: UseCallRecorderOpts = {}): UseCallRecorderReturn {
   const streamRef = useRef<MediaStream | null>(null);
@@ -43,15 +45,16 @@ export function useCallRecorder(opts: UseCallRecorderOpts = {}): UseCallRecorder
   const onSpeechStartRef = useRef(opts.onSpeechStart);
   const onSpeechEndRef = useRef(opts.onSpeechEnd);
   const onErrorRef = useRef(opts.onError);
-  // Lower multiplier = easier to interrupt while AI is speaking.
-  // Browser echoCancellation strips most of the AI's own voice, so 1.3 is safe.
-  const playbackMultRef = useRef(opts.playbackThresholdMultiplier ?? 1.3);
+  // Higher multiplier = harder to accidentally interrupt AI playback.
+  // echoCancellation cancels the AI's voice; residual echo is typically < 0.005 RMS.
+  // 3.5× gives threshold ~0.021 — above residual echo, reachable by normal speech.
+  const playbackMultRef = useRef(opts.playbackThresholdMultiplier ?? 3.5);
   const voiceStreakRef = useRef(0);
 
   useEffect(() => { onSpeechStartRef.current = opts.onSpeechStart; }, [opts.onSpeechStart]);
   useEffect(() => { onSpeechEndRef.current = opts.onSpeechEnd; }, [opts.onSpeechEnd]);
   useEffect(() => { onErrorRef.current = opts.onError; }, [opts.onError]);
-  useEffect(() => { playbackMultRef.current = opts.playbackThresholdMultiplier ?? 1.3; }, [opts.playbackThresholdMultiplier]);
+  useEffect(() => { playbackMultRef.current = opts.playbackThresholdMultiplier ?? 3.5; }, [opts.playbackThresholdMultiplier]);
 
   const startUtterance = useCallback(() => {
     const stream = streamRef.current;
@@ -130,11 +133,11 @@ export function useCallRecorder(opts: UseCallRecorderOpts = {}): UseCallRecorder
         const threshold = BASE_SPEECH_THRESHOLD * (playbackActiveRef.current ? playbackMultRef.current : 1);
         const now = performance.now();
 
+        const triggerMs = playbackActiveRef.current ? INTERRUPT_TRIGGER_MS : SPEECH_TRIGGER_MS;
+
         if (rms > threshold) {
-          // Require a short streak above threshold to confirm real speech
-          // (prevents single-frame spikes from triggering an interrupt).
           voiceStreakRef.current += 16; // ~one rAF frame
-          if (!speakingRef.current && voiceStreakRef.current >= INTERRUPT_TRIGGER_MS) {
+          if (!speakingRef.current && voiceStreakRef.current >= triggerMs) {
             speakingRef.current = true;
             speechStartAtRef.current = now;
             startUtterance();
@@ -142,7 +145,9 @@ export function useCallRecorder(opts: UseCallRecorderOpts = {}): UseCallRecorder
           }
           lastVoiceAtRef.current = now;
         } else {
-          if (!speakingRef.current) voiceStreakRef.current = 0;
+          // Decay instead of hard reset — natural speech dips between syllables
+          // so the streak should survive brief quiet frames.
+          if (!speakingRef.current) voiceStreakRef.current = Math.max(0, voiceStreakRef.current - 8);
         }
         if (speakingRef.current && rms <= threshold) {
           const silentFor = now - lastVoiceAtRef.current;

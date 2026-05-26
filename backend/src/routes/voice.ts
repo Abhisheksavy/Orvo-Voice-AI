@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { createSession, voiceChat, textChat, getHistory, clearHistory } from '../controllers/voiceController';
+import { createSession, voiceChat, voiceChatStream, textChat, getHistory, clearHistory } from '../controllers/voiceController';
 
 const router = Router();
 
@@ -19,6 +19,7 @@ const upload = multer({
 
 router.post('/session', createSession);
 router.post('/chat', upload.single('audio'), voiceChat);
+router.post('/chat-stream', upload.single('audio'), voiceChatStream);
 router.post('/chat-text', textChat);
 router.get('/history/:sessionId', getHistory);
 router.delete('/history/:sessionId', clearHistory);

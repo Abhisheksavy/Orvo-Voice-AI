@@ -31,6 +31,24 @@ User in Hindi: "Emergency ward open hai?" → "Haan, hamare emergency services 2
 
 const GEMMA_BACKEND_URL = process.env.GEMMA_BACKEND_URL?.trim() ?? '';
 
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+async function withRetry<T>(fn: () => Promise<T>, attempts = 2, delayMs = 1500): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); }
+    catch (err) {
+      lastErr = err;
+      if (axios.isAxiosError(err) && RETRYABLE_STATUS.has(err.response?.status ?? 0) && i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 function withRag(userText: string, ragContext: string): string {
   if (!ragContext.trim()) return userText;
   return `[Relevant knowledge base context — use this to answer accurately, do not mention the source]\n${ragContext}\n\n[User question]\n${userText}`;
@@ -41,6 +59,8 @@ async function callGemmaServer(
   history: IMessage[],
   customSystemPrompt?: string,
   ragContext = '',
+  numGpu?: number,
+  temperature?: number,
 ): Promise<string> {
   const url = `${GEMMA_BACKEND_URL}/api/chat`;
   const apiKey = process.env.GEMMA_BACKEND_API_KEY ?? '';
@@ -58,7 +78,9 @@ async function callGemmaServer(
     {
       message: withRag(userText, ragContext),
       systemPrompt: finalSystemPrompt,
-      history: history.slice(-10).map((m) => ({ role: m.role, text: m.text })),
+      history: history.slice(-4).map((m) => ({ role: m.role, text: m.text })),
+      ...(numGpu !== undefined ? { numGpu } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
     },
     {
       headers: {
@@ -69,9 +91,19 @@ async function callGemmaServer(
     },
   );
 
-  const reply = (data.reply ?? '').trim();
+  const reply = (data.reply ?? '')
+    .replace(/[*_`#>]/g, '')
+    .replace(/\n{2,}/g, ' ')
+    .replace(/\n/g, ' ')
+    .trim();
   if (!reply) throw new Error('Empty reply from Gemma server');
   return reply;
+}
+
+function groqApiKey(): string {
+  const key = process.env.GROQ_API_KEY?.trim() ?? process.env.GEMMA_API_KEY?.trim() ?? '';
+  if (!key) throw new Error('Groq API key not configured — set GROQ_API_KEY in .env');
+  return key;
 }
 
 async function callGroq(
@@ -82,7 +114,7 @@ async function callGroq(
   ragContext = '',
 ): Promise<string> {
   const model = modelOverride ?? process.env.GEMMA_MODEL ?? 'llama-3.1-8b-instant';
-  const apiKey = process.env.GEMMA_API_KEY ?? '';
+  const apiKey = groqApiKey();
 
   const messages = [
     { role: 'system', content: customSystemPrompt?.trim() || SYSTEM_PROMPT },
@@ -93,14 +125,17 @@ async function callGroq(
     { role: 'user', content: withRag(userText, ragContext) },
   ];
 
-  const { data } = await axios.post<{ choices: { message: { content: string } }[] }>(
-    `${GROQ_BASE}/chat/completions`,
-    { model, messages, temperature: 0.7, max_tokens: 128 },
-    {
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      timeout: 30_000,
-    },
-  );
+  const res = await fetch(`${GROQ_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 256 }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Groq ${res.status}: ${body}`);
+  }
+  const data = await res.json() as { choices: { message: { content: string } }[] };
 
   const raw = data.choices?.[0]?.message?.content ?? '';
   if (!raw) throw new Error('Empty Groq response');
@@ -117,6 +152,134 @@ export type AiProvider = 'local' | 'groq';
 export interface AiChoice {
   provider: AiProvider;
   model?: string;
+  numGpu?: number;
+  temperature?: number;
+}
+
+// ── Streaming generators ──────────────────────────────────────────────────────
+
+async function* streamFromGemmaServer(
+  userText: string,
+  history: IMessage[],
+  customSystemPrompt?: string,
+  ragContext = '',
+  numGpu?: number,
+  temperature?: number,
+): AsyncGenerator<string> {
+  const url = `${GEMMA_BACKEND_URL}/api/chat/stream`;
+  const apiKey = process.env.GEMMA_BACKEND_API_KEY ?? '';
+  const finalSystemPrompt = customSystemPrompt?.trim() || SYSTEM_PROMPT;
+
+  const response = await axios.post(
+    url,
+    {
+      message: withRag(userText, ragContext),
+      systemPrompt: finalSystemPrompt,
+      history: history.slice(-4).map((m) => ({ role: m.role, text: m.text })),
+      ...(numGpu !== undefined ? { numGpu } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      responseType: 'stream',
+      timeout: 120_000,
+    },
+  );
+
+  let buf = '';
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for await (const chunk of response.data as AsyncIterable<any>) {
+    buf += (chunk as Buffer).toString();
+    const blocks = buf.split('\n\n');
+    buf = blocks.pop() ?? '';
+    for (const block of blocks) {
+      const line = block.trim();
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw === '[DONE]') return;
+      try {
+        const { token, error } = JSON.parse(raw) as { token?: string; error?: string };
+        if (error) throw new Error(error);
+        if (token) yield token;
+      } catch { /* skip malformed */ }
+    }
+  }
+}
+
+async function* streamFromGroq(
+  userText: string,
+  history: IMessage[],
+  customSystemPrompt?: string,
+  modelOverride?: string,
+  ragContext = '',
+): AsyncGenerator<string> {
+  const model = modelOverride ?? process.env.GEMMA_MODEL ?? 'llama-3.1-8b-instant';
+  const apiKey = groqApiKey();
+
+  const messages = [
+    { role: 'system', content: customSystemPrompt?.trim() || SYSTEM_PROMPT },
+    ...history.slice(-10).map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.text,
+    })),
+    { role: 'user', content: withRag(userText, ragContext) },
+  ];
+
+  const res = await fetch(`${GROQ_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 256, stream: true }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Groq ${res.status}: ${body}`);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') return;
+        try {
+          const parsed = JSON.parse(raw) as { choices?: { delta?: { content?: string } }[] };
+          const token = parsed.choices?.[0]?.delta?.content ?? '';
+          if (token) yield token;
+        } catch { /* skip malformed chunk */ }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function* streamChatWithGemma(
+  userText: string,
+  history: IMessage[],
+  customSystemPrompt?: string,
+  aiChoice?: AiChoice,
+  ragContext = '',
+): AsyncGenerator<string> {
+  if (aiChoice?.provider === 'local' || (!aiChoice && GEMMA_BACKEND_URL)) {
+    if (!GEMMA_BACKEND_URL) throw new AppError('Local Gemma is not configured.', 503);
+    yield* streamFromGemmaServer(userText, history, customSystemPrompt, ragContext, aiChoice?.numGpu, aiChoice?.temperature);
+    return;
+  }
+  yield* streamFromGroq(userText, history, customSystemPrompt, aiChoice?.model, ragContext);
 }
 
 export async function chatWithGemma(
@@ -132,8 +295,8 @@ export async function chatWithGemma(
         if (!GEMMA_BACKEND_URL) {
           throw new AppError('Local Gemma is not configured — set GEMMA_BACKEND_URL on the server.', 503);
         }
-        logger.debug('Using local Gemma server: ' + GEMMA_BACKEND_URL);
-        return await callGemmaServer(userText, history, customSystemPrompt, ragContext);
+        logger.debug('Using local Gemma server: ' + GEMMA_BACKEND_URL + (aiChoice.numGpu !== undefined ? ` · numGpu=${aiChoice.numGpu}` : '') + (aiChoice.temperature !== undefined ? ` · temp=${aiChoice.temperature}` : ''));
+        return await withRetry(() => callGemmaServer(userText, history, customSystemPrompt, ragContext, aiChoice.numGpu, aiChoice.temperature));
       }
       logger.debug('Using Groq model: ' + (aiChoice.model ?? 'default'));
       return await callGroq(userText, history, customSystemPrompt, aiChoice.model, ragContext);
@@ -141,15 +304,12 @@ export async function chatWithGemma(
 
     if (GEMMA_BACKEND_URL) {
       logger.debug('Using deployed Gemma server: ' + GEMMA_BACKEND_URL);
-      return await callGemmaServer(userText, history, customSystemPrompt, ragContext);
+      return await withRetry(() => callGemmaServer(userText, history, customSystemPrompt, ragContext));
     }
     return await callGroq(userText, history, customSystemPrompt, undefined, ragContext);
   } catch (err) {
-    if (axios.isAxiosError(err)) {
-      logger.error('Inference error', { status: err.response?.status, data: JSON.stringify(err.response?.data) });
-    } else {
-      logger.error('Inference error', { err });
-    }
-    throw new AppError('AI response failed', 502);
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error('Inference error', { msg });
+    throw new AppError(`AI response failed: ${msg}`, 502);
   }
 }

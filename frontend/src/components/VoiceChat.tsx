@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useCallRecorder } from '../hooks/useCallRecorder';
 import { useAmbience, type AmbienceMode } from '../hooks/useAmbience';
-import { createSession, sendAudio, sendText, sendTextOnly, clearHistory, uploadKnowledgeFile, uploadKnowledgeText, listKnowledgeDocs, deleteKnowledgeDoc, type KnowledgeDoc } from '../api/voice';
+import { createSession, sendText, sendTextOnly, streamAudioChunks, clearHistory, uploadKnowledgeFile, uploadKnowledgeText, listKnowledgeDocs, deleteKnowledgeDoc, type KnowledgeDoc } from '../api/voice';
 
 const DEFAULT_SYSTEM_PROMPT = `You are Orvo, an AI-powered virtual receptionist for hospitals and healthcare clinics, designed for real-time voice conversations over phone calls.
 Your role is to speak naturally like a professional hospital front-desk executive — calm, helpful, polite, fast, and conversational.
@@ -57,10 +57,12 @@ interface ModelOption {
   provider: 'local' | 'groq';
   model?: string;
   hint: string;
+  numGpu?: number;
 }
 
 const MODELS: ModelOption[] = [
-  { id: 'local-gemma-4',      label: 'Gemma 4 (Local)',        short: 'Gemma 4',          provider: 'local', hint: 'self-hosted · multimodal · 256K' },
+  { id: 'local-gemma-4-gpu',  label: 'Gemma 2B · GPU (Local)', short: 'Gemma 2B GPU',     provider: 'local', numGpu: 99, hint: 'self-hosted · M2 Metal · ~3-5s' },
+  { id: 'local-gemma-4-cpu',  label: 'Gemma 2B · CPU (Local)', short: 'Gemma 2B CPU',     provider: 'local', numGpu: 0,  hint: 'self-hosted · CPU only · ~10s+' },
   { id: 'groq-llama-3.3-70b', label: 'Llama 3.3 70B (Groq)',   short: 'Llama 3.3 70B',    provider: 'groq',  model: 'llama-3.3-70b-versatile',  hint: 'most capable' },
   { id: 'groq-llama-3.1-8b',  label: 'Llama 3.1 8B (Groq)',    short: 'Llama 3.1 8B',     provider: 'groq',  model: 'llama-3.1-8b-instant',     hint: 'fastest' },
   { id: 'groq-gemma2-9b',     label: 'Gemma 2 9B (Groq)',      short: 'Gemma 2 9B',       provider: 'groq',  model: 'gemma2-9b-it',             hint: 'balanced' },
@@ -90,7 +92,7 @@ export default function VoiceChat() {
   const [sessionId, setSessionId] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [appState, setAppState] = useState<AppState>('idle');
-  const [lang, setLang] = useState('hi-IN');
+  const [lang, setLang] = useState('en-IN');
   const [error, setError] = useState<string | null>(null);
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
@@ -105,6 +107,10 @@ export default function VoiceChat() {
     () => (localStorage.getItem('orvo-ambience') as AmbienceMode) || 'none',
   );
   const [draftAmbience, setDraftAmbience] = useState<AmbienceMode>('none');
+  const [temperature, setTemperature] = useState<number>(
+    () => Number(localStorage.getItem('orvo-temperature') ?? '0.4'),
+  );
+  const [draftTemperature, setDraftTemperature] = useState<number>(0.4);
   const [inCall, setInCall] = useState(false);
   const [widgetOpen, setWidgetOpen] = useState(false);
   const [widgetMessages, setWidgetMessages] = useState<Message[]>([]);
@@ -124,6 +130,9 @@ export default function VoiceChat() {
   const textInputRef = useRef<HTMLInputElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+  const playbackResolveRef = useRef<(() => void) | null>(null);
+  const unmuteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const langRef = useRef<HTMLDivElement | null>(null);
   const modelRef = useRef<HTMLDivElement | null>(null);
   const appStateRef = useRef<AppState>('idle');
@@ -136,8 +145,13 @@ export default function VoiceChat() {
     [selectedModelId],
   );
   const aiChoice = useMemo(
-    () => ({ aiProvider: selectedModel.provider, aiModel: selectedModel.model }),
-    [selectedModel],
+    () => ({
+      aiProvider: selectedModel.provider,
+      aiModel: selectedModel.model,
+      numGpu: selectedModel.numGpu,
+      ...(selectedModel.provider === 'local' ? { temperature } : {}),
+    }),
+    [selectedModel, temperature],
   );
   // Stable ref for use inside recorder callbacks (avoid stale closures)
   const aiChoiceRef = useRef(aiChoice);
@@ -167,21 +181,30 @@ export default function VoiceChat() {
       audioUrlRef.current = null;
     }
     audioRef.current = null;
+    // Resolve any pending playAudio promise so its finally-block always runs.
+    const res = playbackResolveRef.current;
+    playbackResolveRef.current = null;
+    res?.();
   }, []);
 
   const playAudio = useCallback((base64: string, mimeType: string): Promise<void> => {
     return new Promise((resolve) => {
+      playbackResolveRef.current = resolve;
       try {
         const blob = new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type: mimeType });
         const url = URL.createObjectURL(blob);
         audioUrlRef.current = url;
         const audio = new Audio(url);
         audioRef.current = audio;
-        audio.onended = () => { stopPlayback(); resolve(); };
-        audio.onerror = () => { stopPlayback(); resolve(); };
-        void audio.play();
+        audio.onended = () => { stopPlayback(); };
+        audio.onerror = () => { stopPlayback(); };
+        const playPromise = audio.play();
+        // If browser blocks autoplay, resolve immediately so we don't get stuck.
+        if (playPromise !== undefined) {
+          playPromise.catch(() => { stopPlayback(); });
+        }
       } catch {
-        resolve();
+        stopPlayback();
       }
     });
   }, [stopPlayback]);
@@ -203,59 +226,133 @@ export default function VoiceChat() {
 
   // ── Call recorder (VAD-based, hands-free) ─────────────────────────────────────
   const handleUtterance = useCallback(async (blob: Blob) => {
-    // Ignore very short blobs
-    if (!blob || blob.size < 1000) {
+    const minSize = appStateRef.current === 'recording' ? 3000 : 1000;
+    if (!blob || blob.size < minSize) {
       setAppState((s) => (s === 'recording' ? 'listening' : s));
       return;
     }
     if (!sessionIdRef.current) return;
 
-    // If AI was speaking, this utterance is an interruption — stop playback first.
+    // Abort any previous in-flight stream before starting a new one
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     stopPlayback();
     callRef.current.setPlaybackActive(false);
-
     setAppState('processing');
-    callRef.current.setMuted(true); // ignore mic events while we wait
+    callRef.current.setMuted(true);
     setError(null);
+
+    let userText = '';
+    let assistantText = '';
+    const t0 = performance.now();
+
     try {
-      const result = await sendAudio(
+      const stream = streamAudioChunks(
         blob,
         sessionIdRef.current,
         langRefValue.current,
         systemPromptRef.current,
         aiChoiceRef.current,
+        ctrl.signal,
       );
-      // Empty transcript (noise blob) — silently go back to listening
-      if (result.empty) return;
-      setMessages((prev) => [
-        ...prev,
-        { id: uuidv4(), role: 'user',      text: result.userText      },
-        { id: uuidv4(), role: 'assistant', text: result.assistantText },
-      ]);
-      setAppState('speaking');
-      callRef.current.setPlaybackActive(true);
-      callRef.current.setMuted(false); // unmute now so we can detect interruption
-      await playAudio(result.audioBase64, result.audioMimeType);
-    } catch {
+
+      // Audio queue: plays chunks in sequence; allows next chunk to be received
+      // while current one is still playing.
+      const audioQueue: Array<{ base64: string; mime: string }> = [];
+      let draining = false;
+
+      const drainQueue = async () => {
+        if (draining) return;
+        draining = true;
+        while (audioQueue.length > 0) {
+          // Stop draining if interrupted or call ended
+          if (ctrl.signal.aborted || appStateRef.current === 'idle') break;
+          const { base64, mime } = audioQueue.shift()!;
+          await playAudio(base64, mime);
+        }
+        draining = false;
+      };
+
+      for await (const event of stream) {
+        if (ctrl.signal.aborted) break;
+        if (event.type === 'empty') return;
+
+        if (event.type === 'error') {
+          setError('Something went wrong. Please try again.');
+          return;
+        }
+
+        if (event.type === 'transcript') {
+          userText = event.text;
+          // Show user message and switch to speaking state as soon as transcript arrives
+          setMessages((prev) => [...prev, { id: uuidv4(), role: 'user', text: userText }]);
+          setAppState('speaking');
+          callRef.current.setPlaybackActive(true);
+          unmuteTimerRef.current = setTimeout(() => {
+            callRef.current.setMuted(false);
+            unmuteTimerRef.current = null;
+          }, 500);
+        }
+
+        if (event.type === 'audio') {
+          assistantText += (assistantText ? ' ' : '') + event.text;
+          // Update assistant message live as sentences arrive
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant') {
+              return [...prev.slice(0, -1), { ...last, text: assistantText }];
+            }
+            return [...prev, { id: uuidv4(), role: 'assistant', text: assistantText }];
+          });
+          audioQueue.push({ base64: event.audioBase64, mime: event.audioMimeType });
+          void drainQueue();
+        }
+
+        if (event.type === 'done') {
+          const mode = aiChoiceRef.current.aiProvider === 'local'
+            ? `LOCAL ${aiChoiceRef.current.numGpu ? 'GPU' : 'CPU'} (streaming, temp=${(aiChoiceRef.current as { temperature?: number }).temperature?.toFixed(2) ?? '?'})`
+            : 'GROQ (streaming)';
+          console.log(
+            `%c[ORVO TIMING]%c [${mode}] LLM: ${event.llmMs}ms | TOTAL: ${event.totalMs}ms | perceived: ${Math.round(performance.now() - t0)}ms`,
+            'color:#7c3aed;font-weight:bold',
+            'color:inherit',
+          );
+        }
+      }
+
+      // Wait for the audio queue to finish playing (no-op if aborted)
+      await drainQueue();
+
+    } catch (err) {
+      // AbortError = user intentionally interrupted — not an error to show
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       setError('Something went wrong. Please try again.');
     } finally {
-      callRef.current.setPlaybackActive(false);
-      callRef.current.setMuted(false);
-      // Return to listening if call is still active
-      setAppState((s) => (s === 'idle' ? 'idle' : 'listening'));
+      if (unmuteTimerRef.current) { clearTimeout(unmuteTimerRef.current); unmuteTimerRef.current = null; }
+      // If aborted, the NEW utterance owns state — don't reset it here
+      if (!ctrl.signal.aborted) {
+        callRef.current.setPlaybackActive(false);
+        callRef.current.setMuted(false);
+        setAppState((s) => (s === 'idle' ? 'idle' : 'listening'));
+      }
     }
   }, [playAudio, stopPlayback]);
 
   const handleSpeechStart = useCallback(() => {
-    // Interrupt any ongoing playback the moment the user speaks.
+    if (appStateRef.current === 'processing') return;
     if (appStateRef.current === 'speaking') {
+      // User is interrupting — cancel the SSE stream + drain loop, stop audio immediately.
+      abortRef.current?.abort();
+      if (unmuteTimerRef.current) { clearTimeout(unmuteTimerRef.current); unmuteTimerRef.current = null; }
       stopPlayback();
+      callRef.current.setPlaybackActive(false);
+      callRef.current.setMuted(false);
+      setAppState('recording');
+    } else {
+      setAppState('recording');
     }
-    if (appStateRef.current === 'processing') {
-      // Already processing — ignore new starts until response arrives.
-      return;
-    }
-    setAppState('recording');
   }, [stopPlayback]);
 
   const handleRecError = useCallback((msg: string) => {
@@ -318,6 +415,18 @@ export default function VoiceChat() {
     setAppState('processing');
     try {
       const result = await sendText(text, sessionId, lang, systemPrompt, aiChoice);
+      if (result._timing) {
+        const t = result._timing;
+        const m = aiChoice;
+        const mode = m.aiProvider === 'local'
+          ? `LOCAL ${m.numGpu ? 'GPU' : 'CPU'} (numGpu=${m.numGpu ?? 0}, temp=${(m as { temperature?: number }).temperature?.toFixed(2) ?? '?'})`
+          : 'GROQ';
+        console.log(
+          `%c[ORVO TIMING]%c [${mode}] STT: ${t.sttMs}ms | RAG: ${t.ragMs}ms | LLM: ${t.llmMs}ms | TTS: ${t.ttsMs}ms | TOTAL: ${t.totalMs}ms`,
+          'color:#7c3aed;font-weight:bold',
+          'color:inherit',
+        );
+      }
       setMessages((prev) => [
         ...prev,
         { id: uuidv4(), role: 'user',      text: result.userText      },
@@ -467,7 +576,11 @@ export default function VoiceChat() {
               title="AI model"
             >
               <span className={`w-1.5 h-1.5 rounded-full ${
-                selectedModel.provider === 'local' ? 'bg-emerald-500' : 'bg-amber-500'
+                selectedModel.provider === 'local' && selectedModel.numGpu
+                  ? 'bg-emerald-500'
+                  : selectedModel.provider === 'local'
+                  ? 'bg-blue-400'
+                  : 'bg-amber-500'
               }`} />
               <span className="hidden sm:inline">{selectedModel.short}</span>
               <svg className="w-3 h-3 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -494,10 +607,12 @@ export default function VoiceChat() {
                     <div className="flex items-center justify-between gap-2">
                       <span className={`text-xs font-semibold ${m.id === selectedModelId ? 'text-indigo-700' : 'text-slate-800'}`}>{m.label}</span>
                       <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold tracking-wider ${
-                        m.provider === 'local'
+                        m.provider === 'local' && m.numGpu
                           ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200'
+                          : m.provider === 'local'
+                          ? 'bg-blue-50 text-blue-700 ring-1 ring-blue-200'
                           : 'bg-amber-50 text-amber-700 ring-1 ring-amber-200'
-                      }`}>{m.provider.toUpperCase()}</span>
+                      }`}>{m.provider === 'local' ? (m.numGpu ? 'GPU' : 'CPU') : 'GROQ'}</span>
                     </div>
                     <div className="text-[10.5px] text-slate-500 mt-0.5">{m.hint}</div>
                   </button>
@@ -551,7 +666,7 @@ export default function VoiceChat() {
 
           {/* Settings gear */}
           <button
-            onClick={() => { setDraftPrompt(systemPrompt); setDraftAmbience(ambience); setShowSettings(true); }}
+            onClick={() => { setDraftPrompt(systemPrompt); setDraftAmbience(ambience); setDraftTemperature(temperature); setShowSettings(true); }}
             className="flex items-center justify-center w-9 h-9 rounded-lg bg-white hover:bg-slate-50 text-slate-500 hover:text-slate-700 border border-slate-200 shadow-sm transition cursor-pointer"
             title="Settings"
           >
@@ -909,6 +1024,56 @@ export default function VoiceChat() {
                 </div>
               </div>
 
+              {/* Temperature — local models only */}
+              {selectedModel.provider === 'local' && (
+                <div>
+                  <label className="block text-[11.5px] font-semibold text-slate-800 mb-1 uppercase tracking-wider">
+                    Response temperature
+                  </label>
+                  <p className="text-[12px] text-slate-500 mb-3 leading-relaxed">
+                    Controls how creative vs. focused the AI's replies are. Lower = more precise, higher = more varied.
+                  </p>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] text-slate-400 w-14 text-right shrink-0">Focused</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1.5"
+                      step="0.05"
+                      value={draftTemperature}
+                      onChange={(e) => setDraftTemperature(Number(e.target.value))}
+                      className="flex-1 accent-indigo-600 cursor-pointer"
+                    />
+                    <span className="text-[11px] text-slate-400 w-14 shrink-0">Creative</span>
+                  </div>
+                  <div className="flex items-center justify-between mt-2">
+                    <span className="text-[11px] text-slate-400">0.0</span>
+                    <span className="text-[13px] font-semibold text-indigo-600 tabular-nums">{draftTemperature.toFixed(2)}</span>
+                    <span className="text-[11px] text-slate-400">1.5</span>
+                  </div>
+                  <div className="flex gap-1.5 mt-2">
+                    {[
+                      { label: 'Precise', value: 0.1 },
+                      { label: 'Balanced', value: 0.4 },
+                      { label: 'Creative', value: 0.8 },
+                      { label: 'Wild', value: 1.2 },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        onClick={() => setDraftTemperature(preset.value)}
+                        className={`flex-1 text-[10.5px] py-1 rounded-lg border font-medium transition cursor-pointer ${
+                          Math.abs(draftTemperature - preset.value) < 0.03
+                            ? 'bg-indigo-50 border-indigo-300 text-indigo-700'
+                            : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* System prompt */}
               <div>
                 <label className="block text-[11.5px] font-semibold text-slate-800 mb-1 uppercase tracking-wider">
@@ -947,6 +1112,10 @@ export default function VoiceChat() {
                   setAmbience(draftAmbience);
                   localStorage.setItem('orvo-ambience', draftAmbience);
                   if (inCall) setAmbienceMode(draftAmbience);
+                  if (selectedModel.provider === 'local') {
+                    setTemperature(draftTemperature);
+                    localStorage.setItem('orvo-temperature', String(draftTemperature));
+                  }
                   setShowSettings(false);
                 }}
                 className="px-4 py-2 text-[13px] font-semibold bg-gradient-to-br from-indigo-500 to-indigo-700 hover:from-indigo-600 hover:to-indigo-800 text-white rounded-lg shadow-md shadow-indigo-500/25 ring-1 ring-inset ring-white/10 transition cursor-pointer"
